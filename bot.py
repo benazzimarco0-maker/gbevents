@@ -1,5 +1,8 @@
+import asyncio
 import json
 import os
+import threading
+import streamlit as st
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -9,22 +12,25 @@ from telegram.ext import (
 )
 
 # --- CONFIGURAZIONE ---
-TOKEN = os.environ.get("9269015022:AAE6SkbxlUbhPeQrpuZnFrJM42zrr6d6rs8")
+TOKEN = st.secrets.get("9269015022:AAE6SkbxlUbhPeQrpuZnFrJM42zrr6d6rs8") or os.environ.get("9269015022:AAE6SkbxlUbhPeQrpuZnFrJM42zrr6d6rs8")
 DB_FILE = "dati_bot.json"
-PUNTI_INIZIALI = 20  # Punti assegnati a ogni nuovo giocatore
+PUNTI_INIZIALI = 20
+file_lock = threading.Lock()
 
 
-# --- GESTIONE DATABASE JSON ---
+# --- GESTIONE DATABASE JSON (THREAD-SAFE) ---
 def carica_dati():
-    if not os.path.exists(DB_FILE):
-        return {"utenti": {}, "sfida_attiva": None}
-    with open(DB_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    with file_lock:
+        if not os.path.exists(DB_FILE):
+            return {"utenti": {}, "sfida_attiva": None}
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
 
 
 def salva_dati(dati):
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(dati, f, indent=4, ensure_ascii=False)
+    with file_lock:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(dati, f, indent=4, ensure_ascii=False)
 
 
 def registra_utente_se_nuovo(dati, user):
@@ -39,15 +45,12 @@ def registra_utente_se_nuovo(dati, user):
 
 # --- FUNZIONI DI SUPPORTO PER IL TEMPO ---
 def tempo_in_secondi(testo_tempo: str):
-    """Converte 'MM:SS' o 'HH:MM:SS' in secondi. Ritorna None se non valido."""
     parti = testo_tempo.strip().split(":")
     try:
         if len(parti) == 2:
-            minuti, secondi = int(parti[0]), int(parti[1])
-            return minuti * 60 + secondi
+            return int(parti[0]) * 60 + int(parti[1])
         elif len(parti) == 3:
-            ore, minuti, secondi = int(parti[0]), int(parti[1]), int(parti[2])
-            return ore * 3600 + minuti * 60 + secondi
+            return int(parti[0]) * 3600 + int(parti[1]) * 60 + int(parti[2])
     except ValueError:
         return None
     return None
@@ -94,7 +97,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         f"Ciao {dati['utenti'][uid]['nome']}! Hai **{dati['utenti'][uid]['punti']} punti**.\n\n"
-        "**Comandi disponibili:**\n"
+        "**Comandi disponibili nel gruppo:**\n"
         "• `/sfida 30:00 Bigba fa 10 giri del parco?` → Sfida con tempo limite\n"
         "• `/sfida Bigba arriva primo?` → Sfida senza tempo\n"
         "• `/chiudi` → Blocca le puntate prima dell'inizio\n"
@@ -126,9 +129,7 @@ async def classifica(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Nessun giocatore registrato! Scrivete /punti per entrare.")
         return
 
-    ordinati = sorted(
-        dati["utenti"].values(), key=lambda x: x["punti"], reverse=True
-    )
+    ordinati = sorted(dati["utenti"].values(), key=lambda x: x["punti"], reverse=True)
     testo = "📊 **CLASSIFICA PUNTI** 📊\n\n"
     for pos, u in enumerate(ordinati, start=1):
         medaglia = "🥇" if pos == 1 else "🥈" if pos == 2 else "🥉" if pos == 3 else f"{pos}."
@@ -139,9 +140,7 @@ async def classifica(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ricarica(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dati = carica_dati()
-    importo = 10
-    if context.args and context.args[0].isdigit():
-        importo = int(context.args[0])
+    importo = int(context.args[0]) if (context.args and context.args[0].isdigit()) else 10
 
     ricaricati = []
     for uid, u in dati["utenti"].items():
@@ -162,19 +161,20 @@ async def ricarica(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dati = carica_dati()
     salva_dati(dati)
-    with open(DB_FILE, "rb") as f:
-        await update.message.reply_document(
-            document=f,
-            filename="dati_bot.json",
-            caption="💾 Ecco il backup aggiornato. Per ripristinarlo in futuro, rispondi a questo file scrivendo `/ripristina`.",
-            parse_mode="Markdown",
-        )
+    with file_lock:
+        with open(DB_FILE, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename="dati_bot.json",
+                caption="💾 Ecco il backup. Rispondi a questo file scrivendo `/ripristina` per ricaricarlo.",
+                parse_mode="Markdown",
+            )
 
 
 async def ripristina(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message or not update.message.reply_to_message.document:
         await update.message.reply_text(
-            "⚠️ Per ripristinare i punti, **rispondi (Reply)** al messaggio con il file `dati_bot.json` scrivendo `/ripristina`.",
+            "⚠️ Rispondi al file `dati_bot.json` scrivendo `/ripristina`.",
             parse_mode="Markdown",
         )
         return
@@ -188,9 +188,9 @@ async def ripristina(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "utenti" not in nuovi_dati:
             raise ValueError("Formato non valido")
         salva_dati(nuovi_dati)
-        await update.message.reply_text("✅ Backup ripristinato con successo! Controlla con `/classifica`.")
+        await update.message.reply_text("✅ Backup ripristinato! Controlla con `/classifica`.")
     except Exception:
-        await update.message.reply_text("❌ Il file allegato non è un backup valido del bot.")
+        await update.message.reply_text("❌ File non valido.")
 
 
 async def nuova_sfida(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -204,8 +204,7 @@ async def nuova_sfida(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args:
         await update.message.reply_text(
-            "Scrivi il testo della sfida! Esempio:\n"
-            "`/sfida 30:00 Bigba fa 10 giri del parco?`",
+            "Esempio: `/sfida 30:00 Bigba fa 10 giri del parco?`",
             parse_mode="Markdown",
         )
         return
@@ -244,7 +243,7 @@ async def gestisci_puntata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sfida = dati["sfida_attiva"]
 
     if not sfida or not sfida["aperta"]:
-        await query.answer("⛔ Le puntate per questa sfida sono chiuse!", show_alert=True)
+        await query.answer("⛔ Le puntate sono chiuse!", show_alert=True)
         return
 
     uid = registra_utente_se_nuovo(dati, query.from_user)
@@ -258,7 +257,7 @@ async def gestisci_puntata(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if saldo_disponibile < importo:
         await query.answer(
-            f"❌ Non hai abbastanza punti! Saldo disponibile: {saldo_disponibile} pt.",
+            f"❌ Punti insufficienti! Saldo disponibile: {saldo_disponibile} pt.",
             show_alert=True,
         )
         return
@@ -269,7 +268,7 @@ async def gestisci_puntata(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     etichetta = "SÌ" if scelta == "si" else "NO"
     await query.answer(
-        f"✅ Puntati {importo} pt su {etichetta}! (Saldo rimasto: {dati['utenti'][uid]['punti']} pt)"
+        f"✅ Puntati {importo} pt su {etichetta}! (Rimasti: {dati['utenti'][uid]['punti']} pt)"
     )
 
     await query.edit_message_text(
@@ -289,10 +288,7 @@ async def chiudi_puntate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sfida["aperta"] = False
     salva_dati(dati)
-    await update.message.reply_text(
-        "🔒 **Puntate chiuse!** Nessuno può più modificare la propria scelta. Aspettiamo l'esito!",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text("🔒 **Puntate chiuse!**", parse_mode="Markdown")
 
 
 async def esito(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -300,12 +296,12 @@ async def esito(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sfida = dati["sfida_attiva"]
 
     if not sfida:
-        await update.message.reply_text("Non c'è nessuna sfida attiva da chiudere.")
+        await update.message.reply_text("Non c'è nessuna sfida attiva.")
         return
 
     if not context.args:
         await update.message.reply_text(
-            "Specifica l'esito! Es: `/esito 28:40` oppure `/esito si` o `/esito no`.",
+            "Es: `/esito 28:40` oppure `/esito si` o `/esito no`.",
             parse_mode="Markdown",
         )
         return
@@ -317,27 +313,20 @@ async def esito(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sec_effettivi = tempo_in_secondi(valore)
     if sec_effettivi is not None:
         if sfida["tempo_limite_sec"] is None:
-            await update.message.reply_text(
-                "⚠️ Questa sfida non aveva un tempo limite impostato. Usa `/esito si` o `/esito no`.",
-                parse_mode="Markdown",
-            )
+            await update.message.reply_text("⚠️ Sfida senza tempo limite. Usa `/esito si` o `/esito no`.")
             return
         if sec_effettivi < sfida["tempo_limite_sec"]:
             risultato_finale = "si"
-            dettaglio_tempo = f"⏱ Tempo registrato: **{valore}** (obiettivo {sfida['tempo_limite_str']} → **RIUSCITO!**)\n"
+            dettaglio_tempo = f"⏱ Tempo: **{valore}** (limite {sfida['tempo_limite_str']} → **RIUSCITO!**)\n"
         else:
             risultato_finale = "no"
-            dettaglio_tempo = f"⏱ Tempo registrato: **{valore}** (obiettivo {sfida['tempo_limite_str']} → **NON RIUSCITO!**)\n"
-
+            dettaglio_tempo = f"⏱ Tempo: **{valore}** (limite {sfida['tempo_limite_str']} → **NON RIUSCITO!**)\n"
     elif valore in ["si", "sì", "yes"]:
         risultato_finale = "si"
     elif valore in ["no"]:
         risultato_finale = "no"
     else:
-        await update.message.reply_text(
-            "❌ Formato non valido. Scrivi un tempo (es. `28:40`) oppure `si` / `no`.",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text("❌ Scrivi un tempo (`28:40`) oppure `si` / `no`.")
         return
 
     vincitori = []
@@ -357,30 +346,28 @@ async def esito(update: Update, context: ContextTypes.DEFAULT_TYPE):
     riepilogo = (
         f"🏁 **ESITO SFIDA: {sfida['titolo']}**\n"
         f"{dettaglio_tempo}"
-        f"Risultato ufficiale: **{esito_testo}**\n\n"
+        f"Risultato: **{esito_testo}**\n\n"
     )
 
     if vincitori:
-        riepilogo += "🎉 **Hanno indovinato (punti raddoppiati):**\n" + "\n".join(vincitori) + "\n\n"
+        riepilogo += "🎉 **Hanno indovinato:**\n" + "\n".join(vincitori) + "\n\n"
     else:
-        riepilogo += "😅 Nessuno ha indovinato stavolta!\n\n"
+        riepilogo += "😅 Nessuno ha indovinato!\n\n"
 
     if perdenti:
         riepilogo += "💸 **Hanno sbagliato:**\n" + "\n".join(perdenti)
 
     dati["sfida_attiva"] = None
     salva_dati(dati)
-
     await update.message.reply_text(riepilogo, parse_mode="Markdown")
 
 
-# --- AVVIO DEL BOT ---
-def main():
-    if not TOKEN:
-        raise ValueError("Errore: variabile d'ambiente BOT_TOKEN non impostata!")
+# --- AVVIO BOT IN BACKGROUND PER STREAMLIT ---
+def avvia_bot_thread():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     app = Application.builder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("punti", punti))
     app.add_handler(CommandHandler("classifica", classifica))
@@ -392,9 +379,39 @@ def main():
     app.add_handler(CommandHandler("esito", esito))
     app.add_handler(CallbackQueryHandler(gestisci_puntata, pattern="^puntata:"))
 
-    print("🤖 Bot avviato e in ascolto...")
-    app.run_polling()
+    app.run_polling(stop_signals=None)
 
 
-if __name__ == "__main__":
-    main()
+@st.cache_resource
+def inizializza_bot():
+    if TOKEN:
+        t = threading.Thread(target=avvia_bot_thread, daemon=True)
+        t.start()
+        return True
+    return False
+
+
+# --- INTERFACCIA WEB STREAMLIT ---
+st.set_page_config(page_title="Bot Sfide Telegram", page_icon="🏆")
+st.title("🏆 Bot Sfide — Stato & Classifica")
+
+attivo = inizializza_bot()
+if attivo:
+    st.success("🟢 Bot Telegram attivo e in ascolto nel gruppo!")
+else:
+    st.error("⚠️ BOT_TOKEN non trovato! Inseriscilo nei Secrets di Streamlit.")
+
+dati = carica_dati()
+if dati["sfida_attiva"]:
+    st.info(f"📌 **Sfida in corso:** {dati['sfida_attiva']['titolo']}")
+
+st.subheader("📊 Classifica Live")
+if dati["utenti"]:
+    ordinati = sorted(dati["utenti"].values(), key=lambda x: x["punti"], reverse=True)
+    for pos, u in enumerate(ordinati, start=1):
+        st.write(f"**{pos}. {u['nome']}** — {u['punti']} pt")
+else:
+    st.write("Nessun giocatore ancora registrato.")
+
+if st.button("🔄 Aggiorna classifica"):
+    st.rerun()
