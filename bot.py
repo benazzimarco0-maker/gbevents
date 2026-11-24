@@ -12,7 +12,7 @@ from telegram.ext import (
 )
 
 # --- CONFIGURAZIONE ---
-TOKEN = st.secrets.get("9269015022:AAE6SkbxlUbhPeQrpuZnFrJM42zrr6d6rs8") or os.environ.get("9269015022:AAE6SkbxlUbhPeQrpuZnFrJM42zrr6d6rs8")
+TOKEN = "9269015022:AAE6SkbxlUbhPeQrpuZnFrJM42zrr6d6rs8"
 DB_FILE = "dati_bot.json"
 PUNTI_INIZIALI = 20
 file_lock = threading.Lock()
