@@ -23,8 +23,8 @@ PUNTI_INIZIALI = 20
 FUSO_ORARIO = ZoneInfo("Europe/Rome")
 file_lock = threading.Lock()
 
-# Stati della conversazione per /sfida
-CHIEDI_TITOLO, CHIEDI_EVENTO, CHIEDI_SCADENZA = range(3)
+# Stati della conversazione per /sfida (solo 2 passaggi)
+CHIEDI_TITOLO, CHIEDI_DATA_ORA = range(2)
 
 
 # --- GESTIONE DATABASE JSON (THREAD-SAFE) ---
@@ -59,12 +59,14 @@ def registra_utente_se_nuovo(dati, user):
 
 
 def parse_data_ora(testo: str):
-    """Accetta 'GG/MM/AAAA HH:MM' oppure 'GG/MM HH:MM' (usa l'anno corrente)."""
-    testo = testo.strip()
+    """Accetta 'GG/MM HH:MM', 'GG/MM/AAAA HH:MM', 'GG/MM ore HH:MM', ecc."""
+    pulito = testo.strip().lower().replace("alle ", "").replace("ore ", "").replace("-", " ")
+    pulito = " ".join(pulito.split())
     ora_italiana = datetime.now(FUSO_ORARIO)
-    for fmt in ("%d/%m/%Y %H:%M", "%d/%m %H:%M"):
+
+    for fmt in ("%d/%m/%Y %H:%M", "%d/%m %H:%M", "%d/%m/%y %H:%M"):
         try:
-            dt = datetime.strptime(testo, fmt)
+            dt = datetime.strptime(pulito, fmt)
             if fmt == "%d/%m %H:%M":
                 dt = dt.replace(year=ora_italiana.year)
             return dt.replace(tzinfo=FUSO_ORARIO)
@@ -74,7 +76,7 @@ def parse_data_ora(testo: str):
 
 
 def sfida_ancora_aperta(sfida: dict) -> bool:
-    """Controlla in tempo reale se l'orario attuale è prima della scadenza puntate."""
+    """Controlla in tempo reale se l'orario attuale è prima dell'inizio sfida."""
     if not sfida or not sfida.get("aperta", False):
         return False
     scadenza_iso = sfida.get("scadenza_iso")
@@ -100,13 +102,12 @@ def costruisci_tastiera():
 
 def formatta_testo_sfida(sfida, dati):
     aperta = sfida_ancora_aperta(sfida)
-    stato = "🟢 APERTA (clicca per puntare)" if aperta else "🔒 CHIUSA (tempo scaduto per puntare)"
+    stato = "🟢 APERTA (clicca per puntare)" if aperta else "🔒 CHIUSA (sfida iniziata, puntate bloccate)"
 
     testo = (
         f"🏆 NUOVA SFIDA 🏆\n\n"
-        f"📌 Obiettivo: {sfida['titolo']}\n"
-        f"📅 Evento: {sfida['data_evento']}\n"
-        f"⏳ Puntate aperte fino al: {sfida['scadenza_str']}\n"
+        f"📌 {sfida['titolo']}\n"
+        f"📅 Quando: {sfida['scadenza_str']} (puntate aperte fino a quell'ora)\n"
         f"Stato: {stato}\n\n"
     )
 
@@ -132,7 +133,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"Ciao {dati['utenti'][uid]['nome']}! Hai {dati['utenti'][uid]['punti']} punti.\n\n"
         "Comandi disponibili:\n"
-        "• /sfida → Avvia la creazione guidata di una nuova sfida\n"
+        "• /sfida → Crea una nuova sfida (ti chiederò obiettivo, data e ora)\n"
         "• /esito si (oppure no) → Chiude la sfida e assegna i punti\n"
         "• /cancella → Annulla la sfida attiva e rimborsa i punti puntati\n"
         "• /classifica → Mostra i punti di tutti\n"
@@ -143,7 +144,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
-# --- CREAZIONE GUIDATA /sfida ---
+# --- CREAZIONE GUIDATA /sfida (2 DOMANDE) ---
 async def avvia_sfida(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dati = carica_dati()
     if dati["sfida_attiva"] is not None:
@@ -153,7 +154,7 @@ async def avvia_sfida(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await update.message.reply_text(
-        "1️⃣ Qual è l'obiettivo della sfida?\n"
+        "1️⃣ Che sfida vuoi fare?\n"
         "(Es. Bigba fa 10 giri del parco sotto i 30 minuti)\n\n"
         "Scrivi /annulla per interrompere."
     )
@@ -163,41 +164,31 @@ async def avvia_sfida(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ricevi_titolo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["nuova_sfida_titolo"] = update.message.text.strip()
     await update.message.reply_text(
-        "2️⃣ Entro quando si svolge l'evento?\n"
-        "(Es. Domenica alle 18:00 oppure 29/11 ore 16:00)"
+        "2️⃣ Quando avverrà la sfida? Scrivi data e orario (es. 29/11 15:30):\n"
+        "Le puntate resteranno aperte fino a quel momento."
     )
-    return CHIEDI_EVENTO
+    return CHIEDI_DATA_ORA
 
 
-async def ricevi_evento(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["nuova_sfida_evento"] = update.message.text.strip()
-    await update.message.reply_text(
-        "3️⃣ Fino a che giorno e ora si può puntare?\n"
-        "Scrivi nel formato GG/MM HH:MM (es. 29/11 15:30):"
-    )
-    return CHIEDI_SCADENZA
-
-
-async def ricevi_scadenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    testo_scadenza = update.message.text.strip()
-    dt_scadenza = parse_data_ora(testo_scadenza)
+async def ricevi_data_ora(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    testo_data = update.message.text.strip()
+    dt_scadenza = parse_data_ora(testo_data)
 
     if dt_scadenza is None:
         await update.message.reply_text(
-            "❌ Formato orario non riconosciuto. Usa GG/MM HH:MM (esempio: 29/11 15:30):"
+            "❌ Non ho capito data e ora. Scrivile così: GG/MM HH:MM (esempio: 29/11 15:30):"
         )
-        return CHIEDI_SCADENZA
+        return CHIEDI_DATA_ORA
 
     if dt_scadenza <= datetime.now(FUSO_ORARIO):
         await update.message.reply_text(
-            "⚠️ Questo orario è già passato! Inserisci un giorno e un'ora futuri (es. 29/11 15:30):"
+            "⚠️ Questa data/ora è già passata! Inserisci un orario futuro (es. 29/11 15:30):"
         )
-        return CHIEDI_SCADENZA
+        return CHIEDI_DATA_ORA
 
     dati = carica_dati()
     sfida = {
         "titolo": context.user_data["nuova_sfida_titolo"],
-        "data_evento": context.user_data["nuova_sfida_evento"],
         "scadenza_str": dt_scadenza.strftime("%d/%m/%Y alle %H:%M"),
         "scadenza_iso": dt_scadenza.isoformat(),
         "aperta": True,
@@ -227,7 +218,7 @@ async def gestisci_puntata(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not sfida or not sfida_ancora_aperta(sfida):
         salva_dati(dati)
-        await query.answer("⛔ Tempo scaduto! Le puntate per questa sfida sono chiuse.", show_alert=True)
+        await query.answer("⛔ Tempo scaduto! La sfida è iniziata e le puntate sono chiuse.", show_alert=True)
         try:
             await query.edit_message_text(text=formatta_testo_sfida(sfida, dati))
         except Exception:
@@ -348,7 +339,6 @@ async def ricarica(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dati = carica_dati()
     registra_utente_se_nuovo(dati, update.effective_user)
 
-    # Caso 1: Rispondi direttamente a un messaggio dell'amico con "/ricarica 10"
     if update.message.reply_to_message and context.args and context.args[0].lstrip("-").isdigit():
         target_user = update.message.reply_to_message.from_user
         target_uid = registra_utente_se_nuovo(dati, target_user)
@@ -360,7 +350,6 @@ async def ricarica(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Caso 2: Scrivi "/ricarica Nome 10" (o @username 10)
     if len(context.args) < 2 or not context.args[-1].lstrip("-").isdigit():
         await update.message.reply_text(
             "Uso: /ricarica Nome 10 (es. /ricarica Bigba 10)\n"
@@ -432,8 +421,7 @@ def avvia_bot_thread():
         entry_points=[CommandHandler("sfida", avvia_sfida)],
         states={
             CHIEDI_TITOLO: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_titolo)],
-            CHIEDI_EVENTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_evento)],
-            CHIEDI_SCADENZA: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_scadenza)],
+            CHIEDI_DATA_ORA: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_data_ora)],
         },
         fallbacks=[CommandHandler("annulla", annulla_creazione)],
         per_user=True,
