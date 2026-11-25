@@ -23,7 +23,7 @@ PUNTI_INIZIALI = 20
 FUSO_ORARIO = ZoneInfo("Europe/Rome")
 file_lock = threading.Lock()
 
-# Stati della conversazione per /sfida (solo 2 passaggi)
+# Stati della conversazione per /sfida (in chat privata)
 CHIEDI_TITOLO, CHIEDI_DATA_ORA = range(2)
 
 
@@ -31,9 +31,19 @@ CHIEDI_TITOLO, CHIEDI_DATA_ORA = range(2)
 def carica_dati():
     with file_lock:
         if not os.path.exists(DB_FILE):
-            return {"utenti": {}, "sfida_attiva": None}
+            return {
+                "admin_id": None,
+                "gruppo_id": None,
+                "utenti": {},
+                "sfida_attiva": None,
+            }
         with open(DB_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            dati = json.load(f)
+            dati.setdefault("admin_id", None)
+            dati.setdefault("gruppo_id", None)
+            dati.setdefault("utenti", {})
+            dati.setdefault("sfida_attiva", None)
+            return dati
 
 
 def salva_dati(dati):
@@ -58,8 +68,13 @@ def registra_utente_se_nuovo(dati, user):
     return uid
 
 
+def is_admin(dati, user_id: int) -> bool:
+    if dati["admin_id"] is None:
+        return True
+    return str(user_id) == str(dati["admin_id"])
+
+
 def parse_data_ora(testo: str):
-    """Accetta 'GG/MM HH:MM', 'GG/MM/AAAA HH:MM', 'GG/MM ore HH:MM', ecc."""
     pulito = testo.strip().lower().replace("alle ", "").replace("ore ", "").replace("-", " ")
     pulito = " ".join(pulito.split())
     ora_italiana = datetime.now(FUSO_ORARIO)
@@ -76,7 +91,6 @@ def parse_data_ora(testo: str):
 
 
 def sfida_ancora_aperta(sfida: dict) -> bool:
-    """Controlla in tempo reale se l'orario attuale è prima dell'inizio sfida."""
     if not sfida or not sfida.get("aperta", False):
         return False
     scadenza_iso = sfida.get("scadenza_iso")
@@ -102,12 +116,12 @@ def costruisci_tastiera():
 
 def formatta_testo_sfida(sfida, dati):
     aperta = sfida_ancora_aperta(sfida)
-    stato = "🟢 APERTA (clicca per puntare)" if aperta else "🔒 CHIUSA (sfida iniziata, puntate bloccate)"
+    stato = "🟢 APERTA (clicca per puntare)" if aperta else "🔒 CHIUSA (tempo scaduto per puntare)"
 
     testo = (
         f"🏆 NUOVA SFIDA 🏆\n\n"
         f"📌 {sfida['titolo']}\n"
-        f"📅 Quando: {sfida['scadenza_str']} (puntate aperte fino a quell'ora)\n"
+        f"⏳ Termine puntate: {sfida['scadenza_str']}\n"
         f"Stato: {stato}\n\n"
     )
 
@@ -115,38 +129,89 @@ def formatta_testo_sfida(sfida, dati):
     if not puntate:
         testo += "Nessuna puntata ancora registrata."
     else:
-        testo += "Puntate attuali:\n"
-        for uid, info in puntate.items():
+        for uid in puntate.keys():
             nome = dati["utenti"].get(uid, {}).get("nome", "Giocatore")
-            scelta = "SÌ" if info["scelta"] == "si" else "NO"
-            testo += f"• {nome}: {scelta} ({info['punti']} pt)\n"
+            testo += f"• {nome} ha scommesso\n"
 
     return testo
 
 
-# --- COMANDO /start ---
+def testo_classifica(dati):
+    ordinati = sorted(dati["utenti"].values(), key=lambda x: x["punti"], reverse=True)
+    if not ordinati:
+        return "📊 CLASSIFICA PUNTI 📊\n\nNessun giocatore ancora registrato."
+    testo = "📊 CLASSIFICA AGGIORNATA 📊\n\n"
+    for pos, u in enumerate(ordinati, start=1):
+        medaglia = "🥇" if pos == 1 else "🥈" if pos == 2 else "🥉" if pos == 3 else f"{pos}."
+        testo += f"{medaglia} {u['nome']}: {u['punti']} pt\n"
+    return testo
+
+
+# --- COMANDO /start (SOLO IN PRIVATO) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+
     dati = carica_dati()
     uid = registra_utente_se_nuovo(dati, update.effective_user)
+
+    if dati["admin_id"] is None:
+        dati["admin_id"] = uid
     salva_dati(dati)
 
+    if not is_admin(dati, update.effective_user.id):
+        await update.message.reply_text(
+            f"Ciao {dati['utenti'][uid]['nome']}! Hai {dati['utenti'][uid]['punti']} punti.\n"
+            "Le sfide vengono pubblicate nel gruppo: clicca sui pulsanti sotto la sfida per puntare!"
+        )
+        return
+
+    stato_gruppo = "✅ Collegato" if dati["gruppo_id"] else "⚠️ Non ancora collegato (scrivi /collega nel gruppo)"
     msg = (
-        f"Ciao {dati['utenti'][uid]['nome']}! Hai {dati['utenti'][uid]['punti']} punti.\n\n"
-        "Comandi disponibili:\n"
-        "• /sfida → Crea una nuova sfida (ti chiederò obiettivo, data e ora)\n"
-        "• /esito si (oppure no) → Chiude la sfida e assegna i punti\n"
-        "• /cancella → Annulla la sfida attiva e rimborsa i punti puntati\n"
-        "• /classifica → Mostra i punti di tutti\n"
-        "• /ricarica Nome 10 → Aggiunge punti a un membro (es. /ricarica Bigba 10)\n"
+        f"Ciao {dati['utenti'][uid]['nome']} (Admin)! Hai {dati['utenti'][uid]['punti']} punti.\n"
+        f"Gruppo: {stato_gruppo}\n\n"
+        "Comandi Admin (funzionano solo qui in privato):\n"
+        "• /sfida → Crea una nuova sfida e la pubblica nel gruppo\n"
+        "• /esito si (oppure no) → Chiude la sfida, pubblica l'esito e aggiorna la classifica nel gruppo\n"
+        "• /cancella → Annulla la sfida attiva, rimborsa i punti e avvisa il gruppo\n"
+        "• /ricarica Nome 10 → Aggiunge punti a un membro (es. /ricarica Mirko 10)\n"
+        "• /classifica → Controlla la classifica qui in privato\n"
         "• /backup → Scarica il file dei salvataggi\n"
-        "• /ripristina → Rispondi a un file backup per ricaricare i punti"
+        "• /ripristina → Rispondi a un file backup per ricaricarlo"
     )
     await update.message.reply_text(msg)
 
 
-# --- CREAZIONE GUIDATA /sfida (2 DOMANDE) ---
-async def avvia_sfida(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- COMANDO /collega (DA USARE UNA VOLTA NEL GRUPPO SOLO DALL'ADMIN) ---
+async def collega_gruppo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ["group", "supergroup"]:
+        await update.message.reply_text("Scrivi /collega direttamente dentro il gruppo da collegare!")
+        return
+
     dati = carica_dati()
+    if not is_admin(dati, update.effective_user.id):
+        return
+
+    dati["gruppo_id"] = update.effective_chat.id
+    salva_dati(dati)
+    await update.message.reply_text("✅ Gruppo collegato! Da ora in poi tutto si gestisce dalla chat privata.")
+
+
+# --- CREAZIONE GUIDATA /sfida (SOLO ADMIN IN PRIVATO) ---
+async def avvia_sfida(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return ConversationHandler.END
+
+    dati = carica_dati()
+    if not is_admin(dati, update.effective_user.id):
+        return ConversationHandler.END
+
+    if not dati["gruppo_id"]:
+        await update.message.reply_text(
+            "⚠️ Prima devi collegare il gruppo! Vai nel gruppo Telegram e scrivi /collega."
+        )
+        return ConversationHandler.END
+
     if dati["sfida_attiva"] is not None:
         await update.message.reply_text(
             "⚠️ C'è già una sfida attiva! Chiudila con /esito oppure annullala con /cancella."
@@ -164,8 +229,8 @@ async def avvia_sfida(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ricevi_titolo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["nuova_sfida_titolo"] = update.message.text.strip()
     await update.message.reply_text(
-        "2️⃣ Quando avverrà la sfida? Scrivi data e orario (es. 29/11 15:30):\n"
-        "Le puntate resteranno aperte fino a quel momento."
+        "2️⃣ Entro che data e ora si può puntare?\n"
+        "Scrivi nel formato GG/MM HH:MM (es. 29/11 15:30):"
     )
     return CHIEDI_DATA_ORA
 
@@ -197,10 +262,13 @@ async def ricevi_data_ora(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dati["sfida_attiva"] = sfida
     salva_dati(dati)
 
-    await update.message.reply_text(
-        formatta_testo_sfida(sfida, dati),
+    await context.bot.send_message(
+        chat_id=dati["gruppo_id"],
+        text=formatta_testo_sfida(sfida, dati),
         reply_markup=costruisci_tastiera(),
     )
+
+    await update.message.reply_text("✅ Sfida pubblicata nel gruppo!")
     return ConversationHandler.END
 
 
@@ -210,7 +278,7 @@ async def annulla_creazione(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# --- GESTIONE PUNTATE (PULSANTI SÌ / NO) ---
+# --- GESTIONE PUNTATE ANONIME (PULSANTI NEL GRUPPO) ---
 async def gestisci_puntata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     dati = carica_dati()
@@ -218,7 +286,7 @@ async def gestisci_puntata(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not sfida or not sfida_ancora_aperta(sfida):
         salva_dati(dati)
-        await query.answer("⛔ Tempo scaduto! La sfida è iniziata e le puntate sono chiuse.", show_alert=True)
+        await query.answer("⛔ Tempo scaduto! Le puntate per questa sfida sono chiuse.", show_alert=True)
         try:
             await query.edit_message_text(text=formatta_testo_sfida(sfida, dati))
         except Exception:
@@ -247,20 +315,29 @@ async def gestisci_puntata(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     etichetta = "SÌ" if scelta == "si" else "NO"
     await query.answer(
-        f"✅ Puntati {importo} pt su {etichetta}! (Rimasti: {dati['utenti'][uid]['punti']} pt)"
+        f"✅ Puntata segreta registrata: {importo} pt su {etichetta}! (Rimasti: {dati['utenti'][uid]['punti']} pt)",
+        show_alert=True,
     )
 
-    await query.edit_message_text(
-        text=formatta_testo_sfida(sfida, dati),
-        reply_markup=costruisci_tastiera(),
-    )
+    try:
+        await query.edit_message_text(
+            text=formatta_testo_sfida(sfida, dati),
+            reply_markup=costruisci_tastiera(),
+        )
+    except Exception:
+        pass
 
 
-# --- ESITO E CANCELLA SFIDA ---
+# --- ESITO E CANCELLA SFIDA (SOLO ADMIN IN PRIVATO -> PUBBLICA SUL GRUPPO) ---
 async def esito(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    dati = carica_dati()
-    sfida = dati["sfida_attiva"]
+    if update.effective_chat.type != "private":
+        return
 
+    dati = carica_dati()
+    if not is_admin(dati, update.effective_user.id):
+        return
+
+    sfida = dati["sfida_attiva"]
     if not sfida:
         await update.message.reply_text("Non c'è nessuna sfida attiva.")
         return
@@ -276,12 +353,13 @@ async def esito(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for uid, info in sfida["puntate"].items():
         nome = dati["utenti"][uid]["nome"]
         puntati = info["punti"]
+        scelta_str = "SÌ" if info["scelta"] == "si" else "NO"
         if info["scelta"] == risultato_finale:
             vincita = puntati * 2
             dati["utenti"][uid]["punti"] += vincita
-            vincitori.append(f"• {nome}: +{vincita} pt (puntati {puntati})")
+            vincitori.append(f"• {nome}: +{vincita} pt (puntati {puntati} pt su {scelta_str})")
         else:
-            perdenti.append(f"• {nome}: -{puntati} pt")
+            perdenti.append(f"• {nome}: -{puntati} pt (puntati {puntati} pt su {scelta_str})")
 
     esito_testo = "SÌ ✅" if risultato_finale == "si" else "NO ❌"
     riepilogo = f"🏁 ESITO SFIDA: {sfida['titolo']}\nRisultato: {esito_testo}\n\n"
@@ -292,17 +370,28 @@ async def esito(update: Update, context: ContextTypes.DEFAULT_TYPE):
         riepilogo += "😅 Nessuno ha indovinato!\n\n"
 
     if perdenti:
-        riepilogo += "💸 Hanno sbagliato:\n" + "\n".join(perdenti)
+        riepilogo += "💸 Hanno sbagliato:\n" + "\n".join(perdenti) + "\n\n"
+
+    riepilogo += testo_classifica(dati)
 
     dati["sfida_attiva"] = None
     salva_dati(dati)
-    await update.message.reply_text(riepilogo)
+
+    if dati["gruppo_id"]:
+        await context.bot.send_message(chat_id=dati["gruppo_id"], text=riepilogo)
+
+    await update.message.reply_text("✅ Esito e classifica aggiornata pubblicati nel gruppo!")
 
 
 async def cancella_sfida(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    dati = carica_dati()
-    sfida = dati["sfida_attiva"]
+    if update.effective_chat.type != "private":
+        return
 
+    dati = carica_dati()
+    if not is_admin(dati, update.effective_user.id):
+        return
+
+    sfida = dati["sfida_attiva"]
     if not sfida:
         await update.message.reply_text("Non c'è nessuna sfida attiva da cancellare.")
         return
@@ -314,46 +403,39 @@ async def cancella_sfida(update: Update, context: ContextTypes.DEFAULT_TYPE):
     titolo_vecchio = sfida["titolo"]
     dati["sfida_attiva"] = None
     salva_dati(dati)
-    await update.message.reply_text(
-        f"🗑️ Sfida '{titolo_vecchio}' cancellata! Tutte le puntate sono state rimborsate."
-    )
+
+    if dati["gruppo_id"]:
+        await context.bot.send_message(
+            chat_id=dati["gruppo_id"],
+            text=f"🗑️ La sfida '{titolo_vecchio}' è stata annullata! Tutte le puntate sono state rimborsate.",
+        )
+
+    await update.message.reply_text("✅ Sfida cancellata, punti rimborsati e gruppo avvisato.")
 
 
-# --- CLASSIFICA, RICARICA MIRATA E BACKUP ---
+# --- CLASSIFICA, RICARICA E BACKUP (SOLO ADMIN IN PRIVATO) ---
 async def classifica(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+
     dati = carica_dati()
-    uid = registra_utente_se_nuovo(dati, update.effective_user)
-    salva_dati(dati)
+    if not is_admin(dati, update.effective_user.id):
+        return
 
-    ordinati = sorted(dati["utenti"].values(), key=lambda x: x["punti"], reverse=True)
-    testo = "📊 CLASSIFICA PUNTI 📊\n\n"
-    for pos, u in enumerate(ordinati, start=1):
-        medaglia = "🥇" if pos == 1 else "🥈" if pos == 2 else "🥉" if pos == 3 else f"{pos}."
-        testo += f"{medaglia} {u['nome']}: {u['punti']} pt\n"
-
-    await update.message.reply_text(testo)
+    await update.message.reply_text(testo_classifica(dati))
 
 
 async def ricarica(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Uso: /ricarica Nome 10 (oppure rispondendo a un messaggio dell'utente con /ricarica 10)."""
-    dati = carica_dati()
-    registra_utente_se_nuovo(dati, update.effective_user)
+    if update.effective_chat.type != "private":
+        return
 
-    if update.message.reply_to_message and context.args and context.args[0].lstrip("-").isdigit():
-        target_user = update.message.reply_to_message.from_user
-        target_uid = registra_utente_se_nuovo(dati, target_user)
-        importo = int(context.args[0])
-        dati["utenti"][target_uid]["punti"] += importo
-        salva_dati(dati)
-        await update.message.reply_text(
-            f"🔋 Aggiunti {importo} pt a {dati['utenti'][target_uid]['nome']} (nuovo saldo: {dati['utenti'][target_uid]['punti']} pt)."
-        )
+    dati = carica_dati()
+    if not is_admin(dati, update.effective_user.id):
         return
 
     if len(context.args) < 2 or not context.args[-1].lstrip("-").isdigit():
         await update.message.reply_text(
-            "Uso: /ricarica Nome 10 (es. /ricarica Bigba 10)\n"
-            "Oppure rispondi a un messaggio dell'utente scrivendo /ricarica 10."
+            "Uso: /ricarica Nome 10 (es. /ricarica Mirko 10)"
         )
         return
 
@@ -368,7 +450,7 @@ async def ricarica(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not trovato_uid:
         await update.message.reply_text(
-            f"❌ Utente '{cercato}' non trovato. Assicurati che abbia già fatto almeno una puntata o scritto /start."
+            f"❌ Utente '{cercato}' non trovato. Deve aver fatto almeno una puntata nel gruppo."
         )
         return
 
@@ -380,7 +462,13 @@ async def ricarica(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+
     dati = carica_dati()
+    if not is_admin(dati, update.effective_user.id):
+        return
+
     salva_dati(dati)
     with file_lock:
         with open(DB_FILE, "rb") as f:
@@ -392,6 +480,13 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ripristina(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+
+    dati = carica_dati()
+    if not is_admin(dati, update.effective_user.id):
+        return
+
     if not update.message.reply_to_message or not update.message.reply_to_message.document:
         await update.message.reply_text("⚠️ Rispondi al file dati_bot.json scrivendo /ripristina.")
         return
@@ -404,6 +499,8 @@ async def ripristina(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nuovi_dati = json.loads(contenuto_bytes.decode("utf-8"))
         if "utenti" not in nuovi_dati:
             raise ValueError("Formato non valido")
+        nuovi_dati.setdefault("admin_id", dati["admin_id"])
+        nuovi_dati.setdefault("gruppo_id", dati["gruppo_id"])
         salva_dati(nuovi_dati)
         await update.message.reply_text("✅ Backup ripristinato! Controlla con /classifica.")
     except Exception:
@@ -430,6 +527,7 @@ def avvia_bot_thread():
 
     app.add_handler(conv_sfida)
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("collega", collega_gruppo))
     app.add_handler(CommandHandler("esito", esito))
     app.add_handler(CommandHandler("cancella", cancella_sfida))
     app.add_handler(CommandHandler("classifica", classifica))
@@ -456,7 +554,7 @@ st.title("🏆 Bot Sfide — Stato & Classifica")
 
 attivo = inizializza_bot()
 if attivo:
-    st.success("🟢 Bot Telegram attivo e in ascolto nel gruppo!")
+    st.success("🟢 Bot Telegram attivo!")
 else:
     st.error("⚠️ BOT_TOKEN non trovato! Inseriscilo nel codice o nei Secrets di Streamlit.")
 
